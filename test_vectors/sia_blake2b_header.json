@@ -1,0 +1,10 @@
+{
+  "description": "Legacy Sia block header: ParentID (32 bytes), 64-bit little-endian nonce, timestamp, and Merkle root, hashed once with BLAKE2b-256.",
+  "algorithm": "BLAKE2b-Sia-256",
+  "header_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f080706050403020100f1536500000000a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+  "nonce_offset": 32,
+  "nonce_little_endian_hex": "0807060504030201",
+  "hash_hex": "eab37534b7fd010fe5542cb05c2fcd7d976d625f3272c0410ba75ccd9d7dcd9b",
+  "target_hex": "eab37534b7fd010fe5542cb05c2fcd7d976d625f3272c0410ba75ccd9d7dcd9b",
+  "expected_share": true
+}

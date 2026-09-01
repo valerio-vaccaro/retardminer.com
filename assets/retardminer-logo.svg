@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title description">
+  <title id="title">retardminer poop logo</title>
+  <desc id="description">A smiling brown poop icon.</desc>
+  <path fill="#75411f" d="M127 18c17 19 19 34 10 44 27 1 46 13 51 31 2 7 1 13-3 19 24 5 40 21 40 42 0 9-3 17-8 24 15 8 21 24 15 39-7 17-24 25-49 25H69c-25 0-42-9-47-26-5-17 2-32 18-40-8-10-10-23-6-35 6-20 22-32 43-34-6-12-4-25 4-35 9-11 23-16 40-16 8 0 11-5 10-12 0-7-3-14-10-22-2-3 3-8 6-4Z"/>
+  <path fill="none" stroke="#c98b5a" stroke-linecap="round" stroke-width="11" d="M72 111c21-4 43-2 62 4M92 71c13-5 27-5 40-2" opacity=".65"/>
+  <ellipse cx="89" cy="159" rx="21" ry="24" fill="#fff"/>
+  <ellipse cx="164" cy="159" rx="21" ry="24" fill="#fff"/>
+  <circle cx="96" cy="164" r="9" fill="#26180f"/>
+  <circle cx="157" cy="164" r="9" fill="#26180f"/>
+  <path fill="#26180f" d="M84 194c3-4 8-5 12-2 18 14 42 14 61 0 4-3 9-2 12 2 3 4 2 9-2 12-24 19-57 19-81 0-4-3-5-8-2-12Z"/>
+</svg>

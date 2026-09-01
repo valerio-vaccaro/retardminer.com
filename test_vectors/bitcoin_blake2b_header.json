@@ -1,0 +1,27 @@
+{
+  "description": "Canonical Bitcoin 80-byte genesis block header hashed once with BLAKE2b-256 instead of Bitcoin's normal SHA-256d.",
+  "algorithm": "BLAKE2b-256",
+  "job_id": "retardminer-bitcoin-header-1",
+  "header_layout": [
+    "version: 4 bytes, little-endian",
+    "previous_block_hash: 32 bytes, internal little-endian serialization",
+    "merkle_root: 32 bytes, internal little-endian serialization",
+    "nTime: 4 bytes, little-endian",
+    "nBits: 4 bytes, little-endian",
+    "nonce: 4 bytes, little-endian at offset 76"
+  ],
+  "header_hex": "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c",
+  "nonce_offset": 76,
+  "nonce_little_endian_hex": "1dac2b7c",
+  "hash_hex": "963bb8ec007120171e983206e8a55d5a85d40b9d43f1dee026ad1d6121fbad54",
+  "target_hex": "963bb8ec007120171e983206e8a55d5a85d40b9d43f1dee026ad1d6121fbad54",
+  "expected_share": true,
+  "stratum_notify": {
+    "method": "mining.notify",
+    "params": [
+      "retardminer-bitcoin-header-1",
+      "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c",
+      "963bb8ec007120171e983206e8a55d5a85d40b9d43f1dee026ad1d6121fbad54"
+    ]
+  }
+}
