@@ -2,89 +2,97 @@
   <img src="assets/retardminer-logo.svg" alt="retardminer poop logo" width="128">
 </p>
 
-# retardminer
+<h1 align="center">retardminer</h1>
 
-**Main website:** [retardminer.com](https://retardminer.com/)
+<p align="center">
+  <a href="https://retardminer.com/"><img src="https://img.shields.io/badge/site-retardminer.com-75411f?logo=googlechrome&logoColor=white" alt="Website"></a>
+  <img src="https://img.shields.io/badge/board-ESP32-E7352C?logo=espressif&logoColor=white" alt="ESP32">
+  <img src="https://img.shields.io/badge/build-PlatformIO-orange?logo=platformio&logoColor=white" alt="PlatformIO">
+  <img src="https://img.shields.io/badge/proof%20of%20work-BLAKE2b-41e6a1" alt="BLAKE2b proof of work">
+  <img src="https://img.shields.io/badge/protocol-Stratum%20V1-39a9ff" alt="Stratum V1">
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license">
+</p>
 
-retardminer is an ESP32 PlatformIO proof-of-work miner. It supports two proof-of-work modes, selected in the setup portal, and both speak real Stratum V1 and build their work buffer from job pieces themselves, the way an ordinary ASIC does:
+> 💩 **Editorial verdict:** Bitcoin BLAKE2b is a shitcoin — and the worst kind of one, because it borrows the Bitcoin name to push a fork with no real consensus behind it. Read the full explanation on [The Fork](https://retardminer.com/fork.html).
 
-- **BLAKE2b-Sia:** the legacy 80-byte Sia header—32-byte parent ID, 64-bit little-endian nonce, 64-bit timestamp, and 32-byte Merkle root—hashed once with BLAKE2b-256. It scans the fixed 64-bit nonce at byte offset 32. If the pool's `mining.notify` has nine or more fields, the firmware treats it as a real Stratum V1-style job (previous ID, coinbase parts, Merkle branches, extranonce) and assembles the header and BLAKE2b Merkle root itself—the format F2Pool's Siacoin endpoint uses; otherwise it expects this firmware's small three-field job adapter.
-- **Bitcoin BLAKE2b Stratum V1 (PyBLOCK):** a distinct real-Stratum-V1 job format used by [PyBLOCK](https://pool.pyblock.xyz/)'s BIP-110/BLAKE2b endpoint (`stratum+tcp://pool.pyblock.xyz:4445`, backed by a fork of OCEAN's [DATUM](https://github.com/OCEAN-xyz/datum_gateway) gateway)—not the Bitcoin Knots PR #359 header format, and not Sia's small-JSON adapter. The pool's `mining.notify` reuses the standard nine-field shape but with different contents: `prevhash` is 32 bytes and `ntime` is 8 bytes, both used exactly as sent (no byte-reversal); `coinb1` is a 39-byte value the pool already hashed on its side (3 zero bytes + a 32-byte commitment + 4 zero bytes), not a real Bitcoin coinbase fragment; `coinb2` and the merkle branch list are always empty. The firmware combines that commitment with its own randomly-chosen 8-byte extranonce2 (`0x00 ‖ coinb1 ‖ extranonce1 ‖ extranonce2`, BLAKE2b-256) into a work root, builds an 80-byte buffer (`prevhash ‖ nonce ‖ ntime ‖ root`), hashes it once with BLAKE2b-256, and reverses the digest before comparing it to target—scanning a 32-bit nonce at byte offset 32. Shares are submitted Stratum-V1-style (`username, job_id, extranonce2, ntime, nonce`, no digest).
+retardminer is an ESP32 proof-of-work miner and a deliberately opinionated companion to the [retard pool](https://retardminer.com/). It is useful for learning, experimenting, and measuring what a small microcontroller can do. It is not a serious path to Bitcoin mining revenue.
 
-The setup portal fills in **Pool host** and **Port** automatically when you change the **Proof of work** selector—`sc.f2pool.com:7788` for BLAKE2b-Sia, `pool.pyblock.xyz:4445` for PyBLOCK—so picking a mode is normally enough to point the miner at its reference pool; edit the fields afterwards if you're using a different endpoint.
+## 🧭 What it supports today
 
-## Pool interoperability
+The firmware exposes exactly two selectable proof-of-work modes in its setup portal:
 
-"BLAKE2b" alone is not a mining protocol. Sia's small-JSON path is this firmware's own format: a public pool works only if it sends this firmware's exact job/submission messages (see below).
+- 🟤 **BLAKE2b-Sia** — an 80-byte Sia header hashed once with BLAKE2b-256. It supports the reference F2Pool Siacoin Stratum V1 job format and the included small local demo adapter.
+- 🟠 **Bitcoin BLAKE2b Stratum V1 (PyBLOCK)** — PyBLOCK's BIP-110/BLAKE2b Stratum V1 format. This is a separate fork-specific protocol, not Bitcoin's established proof of work and not the Bitcoin Knots PR #359 header format.
 
-Sia's real-Stratum path and PyBLOCK's BLAKE2b Stratum V1 mode implement real Stratum V1 job distribution for their respective proof-of-work, so they work directly against any pool that follows the same conventions—F2Pool is the reference implementation the Sia path was built against, and PyBLOCK's own pool (backed by its DATUM-gateway fork) is the reference for the BLAKE2b mode. The BLAKE2b job/submission shape (39-byte pre-hashed `coinb1`, no-reversal 8-byte `ntime`, single-round BLAKE2b-256 work root and digest, no XOR key on the wire) was reverse-engineered from that gateway fork's open-source `datum_pow.c`/`datum_stratum.c` and cross-checked against a live capture from `pool.pyblock.xyz:4445`—including submitting a structurally-correct test share, which the pool accepted for parsing and rejected only as `high-hash` (i.e. insufficient difficulty, not a malformed submission). A pool with a non-standard job-distribution protocol still needs its own adapter.
+Both modes assemble their work from pool job data, scan a fixed nonce field, and submit shares using Stratum V1. “BLAKE2b” by itself is not a mining protocol: a pool must implement the matching job and share format.
 
-## Build and configure
+### ⚠️ Why the editorial warning matters
 
-1. Build: `pio run`
-2. Flash: `pio run -t upload`
-3. On first boot (or if Wi-Fi cannot be joined within 20 seconds), connect a phone or computer to **retardminer-setup**. Its captive portal opens automatically; otherwise browse to `http://192.168.4.1`.
-4. Enter a device name, Wi-Fi, pool, payout credentials, and proof-of-work mode—**Pool host** and **Port** fill in automatically for the selected mode, so review or edit them before saving. Save to restart. Settings are stored in the ESP32's non-volatile storage, so reflashing is not required for normal configuration changes.
-5. To force setup mode, hold the board's **BOOT** button while powering or resetting it.
-6. Monitor: `pio device monitor`
+Bitcoin BLAKE2b should be understood as an experimental fork, not as Bitcoin. Changing the proof-of-work algorithm changes the rules miners validate; a name, ticker, or compatible-looking Stratum endpoint cannot create network consensus. Before pointing hardware or money at it, verify the chain, software, node ecosystem, exchange support, and who actually recognizes its blocks.
 
-On the standard ESP32 DevKit, the built-in LED (GPIO 2) also reports status: a slow blink means the setup portal is active, a fast blink means it is retrying the pool, and a short pulse once per second means it is connected and running.
+The pool website makes the same distinction visible in its dashboard: it reports network health, templates, workers, shares, candidates, relay status, and explorer data, while [The Fork](https://retardminer.com/fork.html) explains the editorial case against treating this fork as Bitcoin. The [Docs](https://retardminer.com/docs.html) and [API reference](https://retardminer.com/api.html) cover the pool's live data and endpoints.
 
-After the ESP32 joins Wi-Fi, its configuration page remains available on the LAN. Open `http://<device-name>.local` (default: `http://retardminer.local`) or use the IP address printed on serial output. The page displays its connected IP and lets you edit all stored device, Wi-Fi, pool, and proof-of-work settings; saving restarts the board with the new values.
+> 🔴 The public pool dashboard may be connected to **mainnet**. Block relay and RPC submission can move real funds; treat credentials, payout addresses, and block-broadcast actions accordingly.
 
-The page has three tabs: **Dashboard**, **Pool activity**, and **Configuration**. The live WebSocket dashboard refreshes every five seconds and shows mining state, a fixed 0-30,000 H/s hash-rate gauge/chart, uptime, templates and template age, Wi-Fi signal/channel, pool session data, submitted/accepted/rejected shares, heap and PSRAM headroom, chip details, flash/sketch usage, and ESP32 temperature. **Pool activity** adds the configured endpoint, proof-of-work mode, current template details, the 24 most recent miner/pool messages with the newest first (connection attempts, subscriptions, templates, share submissions, and pool decisions), and a Stratum information panel with pool difficulty, extranonce1/extranonce2 size, block version, nBits, nTime, and the last server message/method. The dashboard uses port `81` on the board, so allow that port on any LAN firewall between your browser and the ESP32. Its **Request new template** button sends `mining.request_template` to the configured pool.
+## 🚀 Build and configure
 
-## Configuration recipes
+Requirements: an ESP32 development board, PlatformIO, and a USB data cable.
 
-In the setup portal, select the **Proof of work** mode first—it auto-fills **Pool host** and **Port** with that mode's reference pool—then set **Username / payout address** to the value expected by that server. Override the host/port if you're pointing at a different pool or the local demo server.
+```sh
+pio run
+pio run -t upload
+pio device monitor
+```
 
-| Goal | Device portal: Proof of work | Host / port |
+1. Flash the firmware and power the board.
+2. On first boot, or after a Wi-Fi failure, connect to **retardminer-setup** and open `http://192.168.4.1` if the captive portal does not appear.
+3. Enter the device name, Wi-Fi credentials, pool credentials, and proof-of-work mode. Selecting a mode fills its reference pool automatically; review or overwrite the host and port before saving.
+4. Save to restart. Settings are kept in ESP32 non-volatile storage.
+5. Hold the board's **BOOT** button while powering or resetting to force setup mode.
+
+After Wi-Fi connects, the configuration and dashboard remain available at `http://<device-name>.local` (default: `http://retardminer.local`) or the IP printed over serial. The dashboard's live WebSocket uses port `81`; allow it through any LAN firewall between the browser and board.
+
+### 📡 Reference pool settings
+
+| Mode | Reference endpoint | Nonce field |
 | --- | --- | --- |
-| Legacy Sia BLAKE2b demo | `BLAKE2b-Sia` | Demo server LAN IP, port `3333` (see below)—overwrite the auto-filled F2Pool address |
-| Real Siacoin Stratum V1 pool (F2Pool) | `BLAKE2b-Sia` | Auto-filled: `sc.f2pool.com:7788` |
-| PyBLOCK BIP-110/BLAKE2b pool | `Bitcoin BLAKE2b Stratum V1 (PyBLOCK)` | Auto-filled: `pool.pyblock.xyz:4445` |
+| BLAKE2b-Sia | `sc.f2pool.com:7788` | 8 bytes at offset 32 |
+| Bitcoin BLAKE2b Stratum V1 (PyBLOCK) | `pool.pyblock.xyz:4445` | 4 bytes at offset 32 |
 
-Both modes use a fixed nonce layout defined by their protocol (BLAKE2b-Sia: offset 32, size 8; PyBLOCK: offset 32, size 4)—there is no user-editable header/nonce setting.
+The endpoint presets are conveniences, not endorsements or guarantees of availability. Pool usernames and payout credentials must follow the selected server's rules.
 
-Sia's small-JSON path deliberately ignores any header layout—its 80-byte format defines it. Sia's real-Stratum path and PyBLOCK's BLAKE2b Stratum V1 mode instead build their work buffer themselves from a nine-field `mining.notify`, so they work directly with pools that speak that job format for their respective proof-of-work.
+## 🧪 Local Sia demo pool
 
-The small-JSON adapter sends `mining.subscribe` and `mining.authorize`, then accepts either:
-
-```json
-{"method":"mining.notify","params":["job-id","header-hex","target-32-byte-hex"]}
-```
-
-or:
-
-```json
-{"method":"mining.notify","params":{"id":"job-id","header":"...","target":"..."}}
-```
-
-`header-hex` must be the complete 80-byte serialized Sia header. Shares on that path are submitted as `mining.submit` with username, job id, decimal nonce, and the calculated digest. This simple format deliberately avoids pretending Bitcoin's coinbase/Merkle Stratum-v1 job format is valid for a different proof-of-work algorithm.
-
-Sia's real-Stratum path and PyBLOCK's BLAKE2b Stratum V1 mode instead send the same `mining.subscribe`/`mining.authorize` pair and consume ordinary Stratum V1 `mining.notify`, `mining.set_difficulty`, and `mining.set_extranonce` messages. Shares are submitted as `mining.submit` with username, job id, extranonce2, nTime, and the nonce as hex (16 hex chars for Sia's 8-byte nonce, 8 for PyBLOCK's 4-byte nonce)—no digest, matching ordinary Stratum V1.
-
-## Local demo pool
-
-Run a development-only pool on a computer reachable from the ESP32:
+The included server is for development and LAN testing. It does not emulate PyBLOCK's real-Stratum format.
 
 ```sh
 python3 tools/demo_pool.py --pow sia
 ```
 
-In the device portal, choose `BLAKE2b-Sia`, set **Pool host** to that computer's LAN IP (overwriting the auto-filled F2Pool address), port to `3333`, and choose any username and password. The server supplies a matching job and independently verifies each submitted nonce and digest. It appends each result to `demo-pool-results.jsonl`. The default target accepts approximately one in 65,536 hashes; use `--target-prefix 00` for easier testing.
+In the portal, select **BLAKE2b-Sia**, replace the automatic host with the computer's LAN IP, keep port `3333`, and enter any username and password. The server creates a matching job, verifies submitted nonces independently, and appends results to `demo-pool-results.jsonl`. Use `--target-prefix 00` for an easier test target.
 
-`tools/demo_pool.py` also implements `--pow plain` and `--pow knots-v2`, small-JSON job formats for the plain-BLAKE2b and Bitcoin Knots PR #359 v2 header algorithms respectively—useful for exercising those algorithms in isolation (see `tests/test_knots_pow.py` and `src/knots_pow.cpp`)—but neither corresponds to a selectable firmware mode any more; the setup portal only offers BLAKE2b-Sia and PyBLOCK. PyBLOCK's real-Stratum job format is not supported by the demo server; test that mode against the real pool.
+## 🔬 Tests and benchmark
 
-The host tests check two official PR #359 header-v2 vectors, covering ASIC profile 0 and profile 1 with a non-zero XOR key, plus the deterministic plain-BLAKE2b fixture at [test_vectors/bitcoin_blake2b_header.json](test_vectors/bitcoin_blake2b_header.json)—the canonical Bitcoin genesis 80-byte header with its normal field layout and 4-byte nonce, differing from Bitcoin only in using BLAKE2b-256 in place of SHA-256d. Run them with `pytest` (or `venv/bin/python -m pytest` when pytest is installed); the BLAKE2b implementation follows RFC 7693 and uses a 32-byte digest.
-
-## Host-side verification and benchmark
-
-The pytest suite compiles the BLAKE2b implementation the firmware also uses for its two modes, plus the standalone Knots v2 header algorithm no firmware mode currently selects, checks every `test_vectors/*.json` fixture against Python's independent `hashlib.blake2b`, then checks the compiled implementation against the same expected digest.
+The host-side tests validate the shared BLAKE2b implementation against independent `hashlib.blake2b` results and the checked-in vectors. Run:
 
 ```sh
-venv/bin/python -m pytest
-venv/bin/python -m pytest -m benchmark -s
+pytest
+pytest -m benchmark -s
 ```
 
-The benchmark reports host-native BLAKE2b-256 hashes/second for 100,000 Bitcoin-format headers. It is deliberately opt-in and has no minimum-rate assertion: host CPU speed does not represent an ESP32's hash rate. Measure the flashed device with its serial rate report for the hardware result.
+The benchmark measures the host CPU only; it is not an ESP32 performance claim. For hardware results, use the live rate in the device dashboard or serial monitor.
+
+## 📊 Device dashboard
+
+The on-device dashboard exposes live hash rate, total hashes, uptime, templates and template age, Wi-Fi signal, pool session state, submitted/accepted/rejected shares, heap and PSRAM headroom, chip and flash details, temperature, recent pool messages, and a **Request new template** action.
+
+For the network pool dashboard, use [retardminer.com](https://retardminer.com/) to:
+
+- 💬 chat in the Trollbox;
+- 👷 check a worker by payout address;
+- 🧱 inspect found block candidates and relay status;
+- 📈 review aggregate hashrate, active workers, difficulty, shares, and network activity.
+
+## 📄 License
+
+MIT — see [LICENSE](LICENSE).
