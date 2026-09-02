@@ -6,11 +6,9 @@
 #include <WebServer.h>
 #include <WebSocketsServer.h>
 #include <WiFi.h>
-#include <mbedtls/sha256.h>
 #include <time.h>
 
 #include "blake2b.h"
-#include "knots_pow.h"
 
 namespace {
 constexpr size_t MAX_HEADER = 256;
@@ -19,8 +17,6 @@ constexpr uint8_t DNS_PORT = 53;
 constexpr uint8_t CONFIG_BUTTON_PIN = 0; // BOOT button on most ESP32 development boards
 constexpr uint8_t STATUS_LED_PIN = 2; // Built-in LED on the common ESP32 DevKit board
 constexpr uint16_t DEFAULT_POOL_PORT = 3333;
-constexpr uint16_t DEFAULT_NONCE_OFFSET = 76;
-constexpr uint8_t DEFAULT_NONCE_SIZE = 4;
 constexpr uint8_t POOL_LOG_CAPACITY = 24;
 constexpr char BRAND_NAME[] = "retardminer";
 constexpr char MAIN_WEBSITE[] = "https://retardminer.com/";
@@ -28,7 +24,7 @@ constexpr char SETTINGS_NAMESPACE[] = "retardminer";
 constexpr char LEGACY_SETTINGS_NAMESPACE[] = "espbip110";
 constexpr char SETUP_SSID[] = "retardminer-setup";
 const char POOP_ICON_SVG[] PROGMEM = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="retardminer poop logo"><path fill="#75411f" d="M127 18c17 19 19 34 10 44 27 1 46 13 51 31 2 7 1 13-3 19 24 5 40 21 40 42 0 9-3 17-8 24 15 8 21 24 15 39-7 17-24 25-49 25H69c-25 0-42-9-47-26-5-17 2-32 18-40-8-10-10-23-6-35 6-20 22-32 43-34-6-12-4-25 4-35 9-11 23-16 40-16 8 0 11-5 10-12 0-7-3-14-10-22-2-3 3-8 6-4Z"/><path fill="none" stroke="#c98b5a" stroke-linecap="round" stroke-width="11" d="M72 111c21-4 43-2 62 4M92 71c13-5 27-5 40-2" opacity=".65"/><ellipse cx="89" cy="159" rx="21" ry="24" fill="#fff"/><ellipse cx="164" cy="159" rx="21" ry="24" fill="#fff"/><circle cx="96" cy="164" r="9" fill="#26180f"/><circle cx="157" cy="164" r="9" fill="#26180f"/><path fill="#26180f" d="M84 194c3-4 8-5 12-2 18 14 42 14 61 0 4-3 9-2 12 2 3 4 2 9-2 12-24 19-57 19-81 0-4-3-5-8-2-12Z"/></svg>)SVG";
-enum PowMode : uint8_t { POW_PLAIN_BLAKE2B = 0, POW_KNOTS_V2 = 1, POW_SIA = 2, POW_BITCOIN_STRATUM = 3 };
+enum PowMode : uint8_t { POW_SIA = 0, POW_PYBLOCK_BLAKE2B = 1 };
 WiFiClient pool;
 WebServer web(80);
 WebSocketsServer websocket(81);
@@ -54,6 +50,9 @@ uint32_t last_dashboard = 0;
 uint32_t last_template_ms = 0, pool_connected_since = 0, last_share_request_id = 0;
 uint32_t pool_connection_attempts = 0, pool_sessions = 0;
 uint32_t subscribe_request_id = 0, authorize_request_id = 0;
+constexpr uint32_t RECONNECT_BACKOFF_MIN_MS = 5000, RECONNECT_BACKOFF_MAX_MS = 300000;
+uint32_t reconnect_backoff_ms = RECONNECT_BACKOFF_MIN_MS;
+bool session_got_reply = false;
 double current_hashrate = 0;
 volatile bool portal_active = false;
 bool web_started = false;
@@ -68,8 +67,6 @@ uint8_t pool_log_start = 0, pool_log_count = 0;
 struct Settings {
   String wifi_ssid, wifi_password, pool_host, pool_username, pool_password, device_name;
   uint16_t pool_port;
-  uint16_t nonce_offset;
-  uint8_t nonce_size;
   PowMode pow_mode;
 };
 Settings settings;
@@ -106,14 +103,12 @@ void load_settings() {
   settings.device_name = preferences.isKey("device_name") ? saved_or_empty("device_name") : BRAND_NAME;
   if (!has_current_settings && settings.device_name == "esp-bip110") settings.device_name = BRAND_NAME;
   settings.pool_port = preferences.isKey("pool_port") ? preferences.getUShort("pool_port") : DEFAULT_POOL_PORT;
-  settings.nonce_offset = preferences.isKey("nonce_off") ? preferences.getUShort("nonce_off") : DEFAULT_NONCE_OFFSET;
-  settings.nonce_size = preferences.isKey("nonce_size") ? preferences.getUChar("nonce_size") : DEFAULT_NONCE_SIZE;
-  settings.pow_mode = preferences.isKey("pow_mode") ? PowMode(preferences.getUChar("pow_mode")) : POW_PLAIN_BLAKE2B;
+  settings.pow_mode = preferences.isKey("pow_mode") ? PowMode(preferences.getUChar("pow_mode")) : POW_SIA;
   preferences.end();
 }
 bool valid_settings(const Settings &s) {
   return s.wifi_ssid.length() && s.pool_host.length() && s.pool_username.length() && s.pool_port &&
-         s.device_name.length() && s.device_name.length() <= 32 && s.pow_mode <= POW_BITCOIN_STRATUM && (s.nonce_size == 4 || s.nonce_size == 8) && s.nonce_offset + s.nonce_size <= MAX_HEADER;
+         s.device_name.length() && s.device_name.length() <= 32 && s.pow_mode <= POW_PYBLOCK_BLAKE2B;
 }
 bool valid_device_name(const String &name) {
   if (!name.length() || name.length() > 32 || name[0] == '-' || name[name.length() - 1] == '-') return false;
@@ -129,11 +124,9 @@ String input(const char *name, const char *label, const String &value, const cha
   return String("<label>") + label + "<input type='" + type + "' name='" + name + "' value='" + html_escape(value) + "'></label>";
 }
 String pow_mode_input() {
-  String out = "<label>Proof of work<select name='pow_mode'>";
-  out += String("<option value=0") + (settings.pow_mode == POW_PLAIN_BLAKE2B ? " selected" : "") + ">Plain BLAKE2b-256</option>";
-  out += String("<option value=1") + (settings.pow_mode == POW_KNOTS_V2 ? " selected" : "") + ">Bitcoin Knots PR #359 v2</option>";
-  out += String("<option value=2") + (settings.pow_mode == POW_SIA ? " selected" : "") + ">BLAKE2b-Sia</option>";
-  out += String("<option value=3") + (settings.pow_mode == POW_BITCOIN_STRATUM ? " selected" : "") + ">Bitcoin SHA-256d Stratum V1 (F2Pool)</option></select></label>";
+  String out = "<label>Proof of work<select name='pow_mode' id='pow_mode'>";
+  out += String("<option value=0") + (settings.pow_mode == POW_SIA ? " selected" : "") + ">BLAKE2b-Sia (F2Pool)</option>";
+  out += String("<option value=1") + (settings.pow_mode == POW_PYBLOCK_BLAKE2B ? " selected" : "") + ">Bitcoin BLAKE2b Stratum V1 (PyBLOCK)</option></select></label>";
   return out;
 }
 String brand_document_head() {
@@ -157,7 +150,7 @@ void send_config_page_legacy(const String &notice = "") {
   if (WiFi.status() == WL_CONNECTED) page += "<p class=notice>Connected: " + WiFi.localIP().toString() + " &middot; Setup address: http://" + html_escape(settings.device_name) + ".local</p>";
   page += R"HTML(<section id="dashboard"><h2>Live board status <span class="live">&#9679; LIVE</span></h2><div class="stats"><div><small>Network / pool</small><strong id="connection">connecting</strong></div><div><small>Current job</small><strong id="job">—</strong></div><div><small>Total hashes</small><strong id="hashes">0</strong></div><div><small>Rate</small><strong id="rate">0 H/s</strong></div></div><div class="visuals"><canvas id="gauge" width="180" height="100"></canvas><canvas id="chart" width="420" height="100"></canvas></div></section><style>#dashboard{background:linear-gradient(145deg,#171d27,#0b0f16);border:1px solid var(--line);border-radius:.75rem;padding:1rem;margin:1rem 0}.live{float:right;color:var(--accent);font-size:.68rem}.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.65rem}.stats div{background:#090d13;border:1px solid #242d3a;padding:.7rem;border-radius:.45rem}.stats small,.stats strong{display:block}.stats small{color:var(--muted);font-size:.72rem}.stats strong{margin-top:.25rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.visuals{display:flex;gap:.65rem;flex-wrap:wrap;margin-top:.65rem}.visuals canvas{max-width:100%;background:#090d13;border:1px solid #242d3a;border-radius:.45rem}</style><script>(()=>{let rates=[];const $=id=>document.getElementById(id),draw=()=>{const g=$("gauge").getContext("2d"),c=$("chart").getContext("2d"),r=rates.at(-1)||0,max=Math.max(1,...rates);g.clearRect(0,0,180,100);g.lineWidth=12;g.strokeStyle="#252f3d";g.beginPath();g.arc(90,90,65,Math.PI,2*Math.PI);g.stroke();g.strokeStyle="#41e6a1";g.shadowColor="#41e6a1";g.shadowBlur=10;g.beginPath();g.arc(90,90,65,Math.PI,Math.PI+Math.min(1,r/max)*Math.PI);g.stroke();g.shadowBlur=0;g.fillStyle="#eff4fa";g.textAlign="center";g.fillText(r.toFixed(1)+" H/s",90,82);c.clearRect(0,0,420,100);c.strokeStyle="#39a9ff";c.lineWidth=2;c.beginPath();rates.forEach((v,i)=>{const x=i*420/Math.max(1,rates.length-1),y=92-v/max*70;i?c.lineTo(x,y):c.moveTo(x,y)});c.stroke();c.fillStyle="#94a3b8";c.textAlign="left";c.fillText("HASH RATE · LAST 60 SECONDS",10,16)};const connect=()=>{const ws=new WebSocket(`ws://${location.hostname}:81/`);ws.onmessage=e=>{const s=JSON.parse(e.data);$("connection").textContent=s.network+" / "+s.pool;$("job").textContent=s.job||"—";$("hashes").textContent=Number(s.hashes).toLocaleString();$("rate").textContent=s.rate.toFixed(1)+" H/s";rates.push(s.rate);if(rates.length>60)rates.shift();draw()};ws.onclose=()=>setTimeout(connect,2000)};connect()})()</script>)HTML";
   page += R"HTML(<style>#dashboard{display:none}.tabs{display:flex;gap:.5rem;margin:1rem 0}.tabs button{margin:0;background:#202938;color:#94a3b8}.tabs button.active{background:var(--accent);color:#03120c}.tab{display:none}.tab.active{display:block}.metric-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:.55rem}.metric{background:#090d13;border:1px solid #242d3a;border-radius:.45rem;padding:.65rem}.metric small,.metric strong{display:block}.metric small{color:var(--muted);font-size:.68rem}.metric strong{font-size:.95rem;margin-top:.25rem}.gauges{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:.6rem}.gauges canvas{background:#090d13;border:1px solid #242d3a;border-radius:.45rem;max-width:100%}</style><div class="tabs"><button id="dashTab" class="active" type="button">Dashboard</button><button id="configTab" type="button">Configuration</button></div><section id="telemetry" class="tab active"><h2>Live telemetry <span class="live">&#9679; LIVE</span></h2><div class="metric-grid"><div class=metric><small>Network / pool</small><strong id=tconnection>connecting</strong></div><div class=metric><small>Job</small><strong id=tjob>—</strong></div><div class=metric><small>Total hashes</small><strong id=thashes>0</strong></div><div class=metric><small>Uptime</small><strong id=tuptime>0s</strong></div><div class=metric><small>Templates received</small><strong id=ttemplates>0</strong></div><div class=metric><small>Free memory</small><strong id=tmem>0 KB</strong></div><div class=metric><small>ESP32 temperature</small><strong id=ttemp>0 °C</strong></div><div class=metric><small>Supply voltage</small><strong id=tvolt>0 V</strong></div><div class=metric><small>Hash rate</small><strong id=trate>0 H/s</strong></div></div><div class=gauges><canvas id=hashGauge width=200 height=110></canvas><canvas id=tempGauge width=200 height=110></canvas><canvas id=voltGauge width=200 height=110></canvas><canvas id=rateChart width=420 height=110></canvas></div></section><script>(()=>{let rates=[];const $=x=>document.getElementById(x),tab=x=>{telemetry.classList.toggle('active',x);config.classList.toggle('active',!x);dashTab.classList.toggle('active',x);configTab.classList.toggle('active',!x)};dashTab.onclick=()=>tab(1);configTab.onclick=()=>tab(0);const gauge=(id,v,max,label,color)=>{let c=$(id),x=c.getContext('2d'),p=Math.max(0,Math.min(1,v/max));x.clearRect(0,0,200,110);x.lineWidth=12;x.strokeStyle='#252f3d';x.beginPath();x.arc(100,94,70,Math.PI,2*Math.PI);x.stroke();x.strokeStyle=color;x.beginPath();x.arc(100,94,70,Math.PI,Math.PI+p*Math.PI);x.stroke();x.fillStyle='#eff4fa';x.textAlign='center';x.fillText(label,100,78);x.fillStyle='#94a3b8';x.fillText('0 — '+max,100,101)};const draw=s=>{gauge('hashGauge',s.rate,20000,s.rate.toFixed(0)+' H/s','#41e6a1');gauge('tempGauge',s.temperature,100,s.temperature.toFixed(1)+' °C','#ff9f43');gauge('voltGauge',s.voltage,5,s.voltage.toFixed(2)+' V','#39a9ff');let c=$('rateChart'),x=c.getContext('2d'),m=20000;x.clearRect(0,0,420,110);x.strokeStyle='#39a9ff';x.beginPath();rates.forEach((v,i)=>{let a=i*420/Math.max(1,rates.length-1),b=96-v/m*78;i?x.lineTo(a,b):x.moveTo(a,b)});x.stroke();x.fillStyle='#94a3b8';x.fillText('HASH RATE · FIXED SCALE 0–20,000 H/s',10,16)};const ws=new WebSocket(`ws://${location.hostname}:81/`);ws.onmessage=e=>{let s=JSON.parse(e.data);tconnection.textContent=s.network+' / '+s.pool;tjob.textContent=s.job||'—';thashes.textContent=Number(s.hashes).toLocaleString();tuptime.textContent=Math.floor(s.uptime/3600)+'h '+Math.floor(s.uptime%3600/60)+'m';ttemplates.textContent=s.templates;tmem.textContent=Math.round(s.free_mem/1024)+' KB';ttemp.textContent=s.temperature.toFixed(1)+' °C';tvolt.textContent=s.voltage.toFixed(2)+' V';trate.textContent=s.rate.toFixed(1)+' H/s';rates.push(s.rate);if(rates.length>60)rates.shift();draw(s)}})()</script>)HTML";
-  page += "<form id=config class=tab method=post action=/save><h2>Device</h2>" + input("device_name", "Device name (.local address)", settings.device_name) + "<h2>Wi-Fi</h2>" + input("ssid", "Network name (SSID)", settings.wifi_ssid) + input("wifi_pw", "Wi-Fi password (leave blank to keep saved password)", "", "password") + "<h2>Pool</h2>" + input("pool_host", "Host", settings.pool_host) + input("pool_port", "Port", String(settings.pool_port), "number") + input("pool_user", "Username / payout address", settings.pool_username) + input("pool_pw", "Pool password", settings.pool_password, "password") + pow_mode_input() + "<h2>Header layout</h2>" + input("nonce_off", "Nonce byte offset (plain mode only)", String(settings.nonce_offset), "number") + input("nonce_size", "Nonce size (4 or 8 bytes; plain mode only)", String(settings.nonce_size), "number") + "<button type=submit>Save and restart</button></form>";
+  page += "<form id=config class=tab method=post action=/save><h2>Device</h2>" + input("device_name", "Device name (.local address)", settings.device_name) + "<h2>Wi-Fi</h2>" + input("ssid", "Network name (SSID)", settings.wifi_ssid) + input("wifi_pw", "Wi-Fi password (leave blank to keep saved password)", "", "password") + "<h2>Pool</h2>" + input("pool_host", "Host", settings.pool_host) + input("pool_port", "Port", String(settings.pool_port), "number") + input("pool_user", "Username / payout address", settings.pool_username) + input("pool_pw", "Pool password", settings.pool_password, "password") + pow_mode_input() + "<button type=submit>Save and restart</button></form>";
   page += R"HTML(<style>#virtualLed{display:inline-block;width:.7rem;height:.7rem;margin-left:.45rem;border-radius:50%;background:#123a66;border:1px solid #287bc7;box-shadow:0 0 .2rem #123a66;vertical-align:middle}#virtualLed.on{background:#38aaff;box-shadow:0 0 .9rem #168cff}</style><script>(()=>{document.querySelector('h1').insertAdjacentHTML('beforeend','<span id="virtualLed" title="Virtual status LED"></span>');let led,clientAt=0;const ws=new WebSocket(`ws://${location.hostname}:81/`);ws.onmessage=e=>{const s=JSON.parse(e.data);led=s;clientAt=Date.now()};setInterval(()=>{if(!led)return;const p=(led.uptime_ms+Date.now()-clientAt)%1000;const on=led.led_mode===0?p<500:led.led_mode===1?p<80:(p%250)<125;virtualLed.classList.toggle('on',on)},40)})()</script></main>)HTML";
   page += R"HTML(<script>(()=>{const t=x=>document.getElementById(x),old=document.querySelector('.gauges');if(old)old.style.display='none';const box=document.createElement('div');box.className='gauges';box.innerHTML='<canvas id="cleanHash" width="200" height="110"></canvas><canvas id="cleanTemp" width="200" height="110"></canvas><canvas id="cleanVolt" width="200" height="110"></canvas><canvas id="cleanChart" width="420" height="110"></canvas>';t('telemetry').append(box);let s,r=[];const gauge=(id,v,max,label,col)=>{const c=t(id),x=c.getContext('2d'),p=Math.max(0,Math.min(1,v/max));x.clearRect(0,0,200,110);x.lineWidth=12;x.strokeStyle='#252f3d';x.beginPath();x.arc(100,94,70,Math.PI,2*Math.PI);x.stroke();x.strokeStyle=col;x.beginPath();x.arc(100,94,70,Math.PI,Math.PI+p*Math.PI);x.stroke();x.fillStyle='#eff4fa';x.textAlign='center';x.fillText(label,100,78);x.fillStyle='#94a3b8';x.fillText('0 - '+max,100,101)};const draw=()=>{if(!s)return;gauge('cleanHash',s.rate,20000,s.rate.toFixed(0)+' H/s','#41e6a1');gauge('cleanTemp',s.temperature,100,s.temperature.toFixed(1)+' deg C','#ff9f43');gauge('cleanVolt',Math.max(0,s.voltage),5,s.voltage<0?'not configured':s.voltage.toFixed(2)+' V','#39a9ff');const c=t('cleanChart'),x=c.getContext('2d');x.clearRect(0,0,420,110);x.strokeStyle='#39a9ff';x.beginPath();r.forEach((v,i)=>{const a=i*420/Math.max(1,r.length-1),b=96-v/20000*78;i?x.lineTo(a,b):x.moveTo(a,b)});x.stroke();x.fillStyle='#94a3b8';x.fillText('HASH RATE - FIXED SCALE 0 - 20000 H/s',10,16);t('ttemp').textContent=s.temperature.toFixed(1)+' deg C';t('tvolt').textContent=s.voltage<0?'not configured':s.voltage.toFixed(2)+' V'};const ws=new WebSocket(`ws://${location.hostname}:81/`);ws.onmessage=e=>{s=JSON.parse(e.data);r.push(s.rate);if(r.length>60)r.shift();draw()};setInterval(draw,250)})()</script>)HTML";
   page += R"HTML(<script>(()=>{const t=x=>document.getElementById(x),host=t('cleanChart').parentElement,add=(id,w=420)=>{const c=document.createElement('canvas');c.id=id;c.width=w;c.height=110;host.append(c)};add('memGauge',200);add('tempChart');add('voltChart');add('memChart');let ts=[],vs=[],ms=[];const gauge=(id,v,max,label,col)=>{const c=t(id),x=c.getContext('2d'),p=Math.max(0,Math.min(1,v/max));x.clearRect(0,0,200,110);x.lineWidth=12;x.strokeStyle='#252f3d';x.beginPath();x.arc(100,94,70,Math.PI,2*Math.PI);x.stroke();x.strokeStyle=col;x.beginPath();x.arc(100,94,70,Math.PI,Math.PI+p*Math.PI);x.stroke();x.fillStyle='#eff4fa';x.textAlign='center';x.fillText(label,100,78);x.fillStyle='#94a3b8';x.fillText('0 - '+max+' KB',100,101)};const chart=(id,a,max,label,col)=>{const c=t(id),x=c.getContext('2d');x.clearRect(0,0,420,110);x.strokeStyle=col;x.lineWidth=2;x.beginPath();a.forEach((v,i)=>{const px=i*420/Math.max(1,a.length-1),py=96-v/max*78;i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke();x.fillStyle='#94a3b8';x.fillText(label,10,16)};const ws=new WebSocket(`ws://${location.hostname}:81/`);ws.onmessage=e=>{const s=JSON.parse(e.data);ts.push(s.temperature);vs.push(Math.max(0,s.voltage));ms.push(s.free_mem/1024);[ts,vs,ms].forEach(a=>{if(a.length>60)a.shift()});gauge('memGauge',ms.at(-1),320,Math.round(ms.at(-1))+' KB','#b783ff');chart('tempChart',ts,100,'TEMPERATURE - FIXED SCALE 0 - 100 deg C','#ff9f43');chart('voltChart',vs,5,'SUPPLY VOLTAGE - FIXED SCALE 0 - 5 V','#39a9ff');chart('memChart',ms,320,'FREE MEMORY - FIXED SCALE 0 - 320 KB','#b783ff')}})()</script>)HTML";
@@ -178,7 +171,8 @@ void send_config_page(const String &notice = "") {
   page.replace("<meta name=viewport", brand_document_head() + "<meta name=viewport");
   page.replace("</style>", ".brand{display:flex;align-items:center;gap:.7rem;margin-bottom:1rem}.brand-logo{width:3.25rem;height:3.25rem}.brand h1{margin:0;text-transform:lowercase}.brand-site,footer a{color:#41e6a1;text-decoration:none}.brand-site:hover,footer a:hover{text-decoration:underline}footer{margin-top:1.5rem;text-align:center;color:var(--muted)}</style>");
   page.replace("<h1>ESP32 BLAKE2b Miner</h1>", brand_header());
-  page += "<form id=config class=tab method=post action=/save><h2>Device</h2>" + input("device_name", "Device name (.local address)", settings.device_name) + "<h2>Wi-Fi</h2>" + input("ssid", "Network name (SSID)", settings.wifi_ssid) + input("wifi_pw", "Wi-Fi password (leave blank to keep saved password)", "", "password") + "<h2>Pool</h2>" + input("pool_host", "Host", settings.pool_host) + input("pool_port", "Port", String(settings.pool_port), "number") + input("pool_user", "Username / payout address", settings.pool_username) + input("pool_pw", "Pool password", settings.pool_password, "password") + pow_mode_input() + "<h2>Header layout</h2>" + input("nonce_off", "Nonce byte offset (plain mode only)", String(settings.nonce_offset), "number") + input("nonce_size", "Nonce size (4 or 8 bytes; plain mode only)", String(settings.nonce_size), "number") + "<button type=submit>Save and restart</button></form>";
+  page += "<form id=config class=tab method=post action=/save><h2>Device</h2>" + input("device_name", "Device name (.local address)", settings.device_name) + "<h2>Wi-Fi</h2>" + input("ssid", "Network name (SSID)", settings.wifi_ssid) + input("wifi_pw", "Wi-Fi password (leave blank to keep saved password)", "", "password") + "<h2>Pool</h2>" + input("pool_host", "Host", settings.pool_host) + input("pool_port", "Port", String(settings.pool_port), "number") + input("pool_user", "Username / payout address", settings.pool_username) + input("pool_pw", "Pool password", settings.pool_password, "password") + pow_mode_input() + "<p class=hint>Pool host and port fill in automatically for the selected proof-of-work mode; edit them afterwards if you're using a different endpoint.</p><button type=submit>Save and restart</button></form>";
+  page += R"HTML(<script>(()=>{const modeHost={0:['sc.f2pool.com',7788],1:['pool.pyblock.xyz',4445]};const powSelect=document.getElementById('pow_mode'),hostInput=document.querySelector("input[name='pool_host']"),portInput=document.querySelector("input[name='pool_port']");if(powSelect&&hostInput&&portInput)powSelect.onchange=()=>{const preset=modeHost[powSelect.value];if(!preset)return;hostInput.value=preset[0];portInput.value=preset[1]}})()</script>)HTML";
   page += R"HTML(<script>(()=>{const $=id=>document.getElementById(id),hist={hash:[],mem:[],temp:[],share:[]};let ws,lastHashes,lastAt,lastTemplates=0;dashTab.onclick=()=>{dashboard.classList.add('active');config.classList.remove('active')};configTab.onclick=()=>{dashboard.classList.remove('active');config.classList.add('active')};const kb=n=>Math.round(n/1024)+' KB',dur=s=>s<60?s+'s':Math.floor(s/60)+'m '+s%60+'s';const gauge=(id,value,max,label,color,unit)=>{const c=$(id),x=c.getContext('2d'),p=Math.max(0,Math.min(1,value/max));x.clearRect(0,0,200,110);x.lineWidth=12;x.strokeStyle='#252f3d';x.beginPath();x.arc(100,94,70,Math.PI,2*Math.PI);x.stroke();x.strokeStyle=color;x.beginPath();x.arc(100,94,70,Math.PI,Math.PI+p*Math.PI);x.stroke();x.fillStyle=color;x.textAlign='center';x.fillText(label,100,78);x.fillStyle='#94a3b8';x.fillText('0 - '+max+' '+unit,100,101)};const chart=(id,values,max,label,color)=>{const c=$(id),x=c.getContext('2d');x.clearRect(0,0,420,110);x.strokeStyle=color;x.lineWidth=2;x.beginPath();values.forEach((v,i)=>{const px=i*420/Math.max(1,values.length-1),py=96-v/max*78;i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke();x.fillStyle='#94a3b8';x.fillText(label,10,16)};const update=s=>{const now=Date.now();let rate=Number(s.rate)||0;if(lastHashes!==undefined&&now>lastAt){const measured=(Number(s.hashes)-lastHashes)*1000/(now-lastAt);if(measured>=0)rate=measured}lastHashes=Number(s.hashes);lastAt=now;const mem=Number(s.free_mem)/1024,tempValue=Number(s.temperature),sent=Number(s.shares_submitted)||0;network.textContent=s.network+' / '+s.pool;job.textContent=s.job||'-';hashes.textContent=Number(s.hashes).toLocaleString();rate.textContent=rate.toFixed(1)+' H/s';memory.textContent=Math.round(mem)+' KB';temp.textContent=tempValue.toFixed(1)+' deg C';shares.textContent=sent.toLocaleString();templates.textContent=s.templates+' / '+(s.template_age<0?'none':dur(s.template_age)+' ago');rssi.textContent=s.wifi_rssi?s.wifi_rssi+' dBm / ch '+s.wifi_channel:'offline';results.textContent=s.shares_accepted+' / '+s.shares_rejected;minheap.textContent=kb(s.min_free_mem);session.textContent=s.pool_uptime?dur(s.pool_uptime):'disconnected';[['hash',rate],['mem',mem],['temp',tempValue],['share',sent]].forEach(([key,value])=>{hist[key].push(value);if(hist[key].length>60)hist[key].shift()});const shareMax=Math.max(10,...hist.share);gauge('hashGauge',rate,20000,rate.toFixed(1)+' H/s','#41e6a1','H/s');gauge('memGauge',mem,320,Math.round(mem)+' KB','#b783ff','KB');gauge('tempGauge',tempValue,100,tempValue.toFixed(1)+' deg C','#ff9f43','deg C');gauge('shareGauge',sent,shareMax,sent+' sent','#f59e0b','');chart('hashChart',hist.hash,20000,'HASH RATE - 0 to 20000 H/s','#41e6a1');chart('memChart',hist.mem,320,'FREE MEMORY - 0 to 320 KB','#b783ff');chart('tempChart',hist.temp,100,'TEMPERATURE - 0 to 100 deg C','#ff9f43');chart('shareChart',hist.share,shareMax,'SHARES SENT TO POOL - TOTAL','#f59e0b');if(s.templates>lastTemplates&&lastTemplates)actionNote.textContent='New template received.';lastTemplates=s.templates};const connect=()=>{ws=new WebSocket(`ws://${location.hostname}:81/`);ws.onopen=()=>actionNote.textContent='Connected. Dashboard refreshes every 5 seconds.';ws.onmessage=e=>{try{update(JSON.parse(e.data))}catch(_){}};ws.onclose=()=>{actionNote.textContent='Board connection lost; retrying...';setTimeout(connect,1000)};ws.onerror=()=>ws.close()};requestTemplate.onclick=()=>{if(ws?.readyState!==WebSocket.OPEN){actionNote.textContent='Board connection not ready.';return}ws.send(JSON.stringify({method:'dashboard.request_template'}));actionNote.textContent='New template requested; waiting for the pool.'};resetBoard.onclick=()=>{if(!confirm('Restart the ESP32 board now?'))return;if(ws?.readyState===WebSocket.OPEN){resetBoard.textContent='Restarting...';ws.send(JSON.stringify({method:'dashboard.reset'}))}else actionNote.textContent='Board connection not ready.'};connect()})()</script></main>)HTML";
   page += R"HTML(<script>(()=>{const updateRate=s=>{document.getElementById('rate').textContent=(Number(s.rate)||0).toFixed(1)+' H/s'};const connect=()=>{const ws=new WebSocket(`ws://${location.hostname}:81/`);ws.onmessage=e=>{try{updateRate(JSON.parse(e.data))}catch(_){}};ws.onclose=()=>setTimeout(connect,1000);ws.onerror=()=>ws.close()};connect()})()</script>)HTML";
   page += R"HTML(<script>(()=>{const $=id=>document.getElementById(id),tabs=$('dashTab').parentElement,infoTab=document.createElement('button'),info=document.createElement('section');infoTab.type='button';infoTab.id='poolTab';infoTab.textContent='Pool activity';tabs.insertBefore(infoTab,$('configTab'));info.id='poolInfo';info.className='tab';info.innerHTML='<h2>Miner and pool information</h2><div class="grid"><div class="metric"><small>Endpoint</small><strong id="poolEndpoint">waiting</strong></div><div class="metric"><small>Proof of work</small><strong id="poolPow">waiting</strong></div><div class="metric"><small>Connection attempts / sessions</small><strong id="poolConnections">0 / 0</strong></div><div class="metric"><small>Current template</small><strong id="poolTemplate">waiting</strong></div><div class="metric"><small>Template header</small><strong id="poolHeader">waiting</strong></div><div class="metric"><small>Shares (accepted / rejected / sent)</small><strong id="poolShares">0 / 0 / 0</strong></div></div><h2>Recent pool messages</h2><p class="hint">Newest messages are shown first. This history is kept on the miner and updates through the WebSocket.</p><ol id="poolLogs" class="pool-logs"><li>Waiting for pool activity...</li></ol>';$('config').insertAdjacentElement('beforebegin',info);const select=which=>{['dashboard','config','poolInfo'].forEach(id=>$(id).classList.toggle('active',id===which))};$('dashTab').onclick=()=>select('dashboard');$('configTab').onclick=()=>select('config');infoTab.onclick=()=>select('poolInfo');const dur=s=>s<60?s+'s':Math.floor(s/60)+'m '+s%60+'s';let ws;const update=s=>{$('poolEndpoint').textContent=(s.pool_host||'not configured')+':'+(s.pool_port||'-')+' ('+s.pool+')';$('poolPow').textContent=s.pow_mode||'unknown';$('poolConnections').textContent=(s.pool_attempts||0)+' / '+(s.pool_sessions||0);$('poolTemplate').textContent=s.job||'no template';$('poolHeader').textContent=s.header_bytes?s.header_bytes+' bytes, '+(s.template_age<0?'age unknown':dur(s.template_age)+' old'):'waiting for a template';$('poolShares').textContent=(s.shares_accepted||0)+' / '+(s.shares_rejected||0)+' / '+(s.shares_submitted||0);const list=$('poolLogs');list.replaceChildren();const logs=Array.isArray(s.pool_logs)?s.pool_logs:[];if(!logs.length){const item=document.createElement('li');item.textContent='No pool messages yet.';list.append(item)}else logs.forEach(entry=>{const item=document.createElement('li');item.textContent=entry;list.append(item)})};const connect=()=>{ws=new WebSocket(`ws://${location.hostname}:81/`);ws.onmessage=e=>{try{update(JSON.parse(e.data))}catch(_){}};ws.onclose=()=>setTimeout(connect,1000);ws.onerror=()=>ws.close()};connect()})()</script><style>.pool-logs{margin:0;padding-left:1.4rem;max-height:26rem;overflow:auto;background:#090d13;border:1px solid var(--line);border-radius:.5rem}.pool-logs li{padding:.55rem .7rem;border-bottom:1px solid #202938;font:12px ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}.pool-logs li:last-child{border-bottom:0}</style>)HTML";
@@ -206,15 +200,14 @@ void configure_web_server() {
     next.device_name = web.arg("device_name");
     next.pool_host = web.arg("pool_host"); next.pool_port = uint16_t(web.arg("pool_port").toInt());
     next.pool_username = web.arg("pool_user"); next.pool_password = web.arg("pool_pw");
-    next.nonce_offset = uint16_t(web.arg("nonce_off").toInt()); next.nonce_size = uint8_t(web.arg("nonce_size").toInt());
     next.pow_mode = PowMode(web.arg("pow_mode").toInt());
-    if (!valid_settings(next) || !valid_device_name(next.device_name)) { send_config_page("Enter a valid device name, Wi-Fi, pool host, username, port, and nonce layout."); return; }
+    if (!valid_settings(next) || !valid_device_name(next.device_name)) { send_config_page("Enter a valid device name, Wi-Fi, pool host, username, and port."); return; }
     preferences.begin(SETTINGS_NAMESPACE, false);
     preferences.putString("ssid", next.wifi_ssid); preferences.putString("wifi_pw", next.wifi_password);
     preferences.putString("pool_host", next.pool_host); preferences.putUShort("pool_port", next.pool_port);
     preferences.putString("pool_user", next.pool_username); preferences.putString("pool_pw", next.pool_password);
     preferences.putString("device_name", next.device_name);
-    preferences.putUShort("nonce_off", next.nonce_offset); preferences.putUChar("nonce_size", next.nonce_size); preferences.putUChar("pow_mode", next.pow_mode);
+    preferences.putUChar("pow_mode", next.pow_mode);
     preferences.end();
     web.send(200, "text/html; charset=utf-8", "<!doctype html><meta charset=utf-8><title>retardminer</title><meta name=viewport content='width=device-width,initial-scale=1'><p>retardminer settings saved. Restarting…</p>"); delay(500); ESP.restart();
   });
@@ -281,7 +274,7 @@ void service_dashboard() {
   status["pool"] = pool.connected() ? "connected" : "disconnected";
   status["pool_host"] = settings.pool_host;
   status["pool_port"] = settings.pool_port;
-  status["pow_mode"] = settings.pow_mode == POW_BITCOIN_STRATUM ? "Bitcoin SHA-256d / Stratum V1" : settings.pow_mode == POW_KNOTS_V2 ? "Knots v2" : settings.pow_mode == POW_SIA ? "BLAKE2b-Sia" : "Plain BLAKE2b-256";
+  status["pow_mode"] = settings.pow_mode == POW_PYBLOCK_BLAKE2B ? "BLAKE2b / Stratum V1 (PyBLOCK)" : "BLAKE2b-Sia";
   status["stratum_difficulty"] = pool_difficulty;
   status["stratum_extranonce1"] = stratum_extranonce1;
   status["stratum_extranonce2_size"] = stratum_extranonce2_size;
@@ -337,9 +330,6 @@ bool decode_hex(const char *text, uint8_t *out, size_t out_size, size_t &written
   written = n / 2; return true;
 }
 String hex_of(const uint8_t *data, size_t n) { const char *d = "0123456789abcdef"; String s; s.reserve(n * 2); for (size_t i = 0; i < n; ++i) { s += d[data[i] >> 4]; s += d[data[i] & 15]; } return s; }
-void sha256d(const uint8_t *input, size_t size, uint8_t out[32]) { uint8_t first[32]; mbedtls_sha256(input, size, first, 0); mbedtls_sha256(first, sizeof(first), out, 0); }
-bool decode_reversed_words(const char *text, uint8_t *out, size_t words) { size_t written = 0; if (!decode_hex(text, out, words * 4, written) || written != words * 4) return false; for (size_t word = 0; word < words; ++word) for (size_t i = 0; i < 2; ++i) { uint8_t &a = out[word * 4 + i], &b = out[word * 4 + 3 - i]; uint8_t swap = a; a = b; b = swap; } return true; }
-void set_stratum_target(double difficulty) { const uint64_t divisor = difficulty >= 1.0 ? uint64_t(difficulty) : 1; const uint8_t diff1[32] = {0,0,0,0,0xff,0xff}; uint64_t remainder = 0; for (size_t i = 0; i < sizeof(target); ++i) { remainder = remainder * 256 + diff1[i]; target[i] = uint8_t(remainder / divisor); remainder %= divisor; } }
 void set_sia_stratum_target(double difficulty) {
   // F2Pool SC Stratum difficulty-1 target, big-endian:
   // 00000000ffffff000000000000000000000000000000000000000000000000
@@ -358,7 +348,72 @@ void set_sia_stratum_target(double difficulty) {
 }
 bool meets_target(const uint8_t hash[32], const uint8_t goal[32]) { for (size_t i = 0; i < 32; ++i) { if (hash[i] < goal[i]) return true; if (hash[i] > goal[i]) return false; } return true; }
 bool meets_target(const uint8_t hash[32]) { return meets_target(hash, target); }
-void send_json(JsonDocument &doc) { serializeJson(doc, pool); pool.print('\n'); }
+// PyBLOCK's BLAKE2b/header-v2 Stratum extension (confirmed against the live pool and the
+// DATUM gateway's bip110-pow-v2 branch, not the Knots PR #359 v2 header format): share
+// difficulty 1 is the ~2^224 all-ones target below, same order of magnitude as Bitcoin's own
+// diff-1, halved by each doubling of difficulty (mirrors DATUM's floorPoT/datum_u256_shr, just
+// with this firmware's most-significant-byte-first target convention instead of DATUM's LE one).
+void set_pyblock_blake2b_target(double difficulty) {
+  uint64_t diff = difficulty >= 1.0 ? uint64_t(difficulty) : 1;
+  uint8_t bits = 0; { uint64_t x = diff; while (x >>= 1) ++bits; }
+  memset(target, 0, 4); memset(target + 4, 0xff, sizeof(target) - 4);
+  const unsigned byte_shift = bits / 8, bit_shift = bits % 8;
+  if (byte_shift >= sizeof(target)) { memset(target, 0, sizeof(target)); return; }
+  if (byte_shift) { memmove(target + byte_shift, target, sizeof(target) - byte_shift); memset(target, 0, byte_shift); }
+  if (bit_shift) { for (int i = 31; i > 0; --i) target[i] = uint8_t((target[i] >> bit_shift) | (target[i - 1] << (8 - bit_shift))); target[0] = uint8_t(target[0] >> bit_shift); }
+}
+// Assembles the 80-byte BLAKE2b work buffer for a PyBLOCK job: prevhash and ntime are used
+// exactly as sent (no byte reversal - confirmed by the 6/3/4 leading/trailing zero bytes the
+// gateway's tagged-hash and Sia-style wrappers leave in them, and by ntime's high 4 bytes
+// decoding to the live wall-clock time), coinb1 is a 39-byte commitment (not a real Bitcoin
+// coinbase fragment) the gateway already hashed for us, and the work root folds in our own
+// extranonce2 - the only piece of the job we choose ourselves.
+bool set_pyblock_blake2b_job(JsonArray job) {
+  last_template_error = "";
+  if (job.size() < 9) { last_template_error = "PyBLOCK BLAKE2b notify has fewer than 9 fields"; return false; }
+  if (!stratum_extranonce1.length() || stratum_extranonce2_size != 8) { last_template_error = "PyBLOCK BLAKE2b requires a 4-byte extranonce1 and 8-byte extranonce2 from subscribe"; return false; }
+  const char *id = job[0] | "";
+  const char *prevhash_hex = job[1] | "";
+  const char *coinb1_hex = job[2] | "";
+  const char *coinb2_hex = job[3] | "";
+  JsonArray branches = job[4].as<JsonArray>();
+  const char *ntime_hex = job[7] | "";
+  if (!id[0]) { last_template_error = "missing job id"; return false; }
+  if (coinb2_hex[0] || branches.size()) { last_template_error = "PyBLOCK BLAKE2b job must have an empty coinb2 and no merkle branches"; return false; }
+  uint8_t prevhash_raw[32], commitment_wire[39], ntime_raw[8] = {}, extranonce1_raw[4];
+  size_t n = 0;
+  if (!decode_hex(prevhash_hex, prevhash_raw, sizeof(prevhash_raw), n) || n != sizeof(prevhash_raw)) { last_template_error = "PyBLOCK prevhash is not exactly 32 bytes of hex"; return false; }
+  if (!decode_hex(coinb1_hex, commitment_wire, sizeof(commitment_wire), n) || n != sizeof(commitment_wire)) { last_template_error = "PyBLOCK coinb1 is not exactly 39 bytes of hex"; return false; }
+  const size_t ntime_len = strlen(ntime_hex);
+  if (ntime_len == 16) { if (!decode_hex(ntime_hex, ntime_raw, sizeof(ntime_raw), n) || n != sizeof(ntime_raw)) { last_template_error = "PyBLOCK ntime is invalid hex"; return false; } }
+  else if (ntime_len == 8) { if (!decode_hex(ntime_hex, ntime_raw, 4, n) || n != 4) { last_template_error = "PyBLOCK ntime is invalid hex"; return false; } }
+  else { last_template_error = "PyBLOCK ntime must be 4 or 8 bytes of hex"; return false; }
+  if (!decode_hex(stratum_extranonce1.c_str(), extranonce1_raw, sizeof(extranonce1_raw), n) || n != sizeof(extranonce1_raw)) { last_template_error = "PyBLOCK extranonce1 is not exactly 4 bytes of hex"; return false; }
+  uint8_t extranonce2_raw[8];
+  for (uint8_t i = 0; i < sizeof(extranonce2_raw); ++i) extranonce2_raw[i] = uint8_t(esp_random() >> ((i & 3) * 8));
+  uint8_t leaf[52] = {};
+  memcpy(leaf + 1, commitment_wire, sizeof(commitment_wire));
+  memcpy(leaf + 40, extranonce1_raw, sizeof(extranonce1_raw));
+  memcpy(leaf + 44, extranonce2_raw, sizeof(extranonce2_raw));
+  uint8_t root[32]; blake2b_256(leaf, sizeof(leaf), root);
+  uint8_t work[80];
+  memcpy(work, prevhash_raw, 32); memset(work + 32, 0, 8); memcpy(work + 40, ntime_raw, 8); memcpy(work + 48, root, 32);
+  job_id = id; stratum_ntime = ntime_hex; stratum_extranonce2 = hex_of(extranonce2_raw, sizeof(extranonce2_raw));
+  header_len = 80; memcpy(header, work, 80); nonce = esp_random(); ++templates_received; last_template_ms = millis();
+  set_pyblock_blake2b_target(pool_difficulty.toDouble());
+  add_pool_log(String("Received PyBLOCK BLAKE2b template ") + job_id);
+  Serial.print("PyBLOCK job: "); Serial.println(job_id);
+  portENTER_CRITICAL(&mining_mux);
+  memcpy(worker_job.header, work, 80); memcpy(worker_job.target, target, sizeof(target)); worker_job.header_len = 80; worker_job.mode = POW_PYBLOCK_BLAKE2B; worker_job.nonce_offset = 32; worker_job.nonce_size = 4; ++worker_job.generation;
+  portEXIT_CRITICAL(&mining_mux);
+  return true;
+}
+// The raw BLAKE2b-256 digest is compared to target as-is (most-significant byte first) - no
+// reversal. set_pyblock_blake2b_target() already builds its target in that same orientation
+// (mirroring the reference miner's target_be(), which pre-reverses the target instead of
+// reversing the digest, since DATUM's own server-side check reverses the digest the other way).
+void pyblock_blake2b_pow(const uint8_t *work, uint8_t output[32]) { blake2b_256(work, 80, output); }
+void send_json(JsonDocument &doc) { String out; serializeJson(doc, out); pool.print(out); pool.print('\n'); }
 void request_new_template() {
   if (!pool.connected()) { Serial.println("cannot request template: pool is disconnected"); add_pool_log("Template request skipped: pool is disconnected"); return; }
   DynamicJsonDocument d(192);
@@ -368,45 +423,22 @@ void request_new_template() {
   send_json(d);
   add_pool_log("Requested a new template from the pool");
 }
-void subscribe() { DynamicJsonDocument d(256); subscribe_request_id = request_id; d["id"] = request_id++; d["method"] = "mining.subscribe"; d["params"].add("retardminer/0.1"); send_json(d); d.clear(); authorize_request_id = request_id; d["id"] = request_id++; d["method"] = "mining.authorize"; JsonArray p = d["params"].to<JsonArray>(); p.add(settings.pool_username); p.add(settings.pool_password); send_json(d); d.clear(); d["id"] = nullptr; d["method"] = "mining.suggest_difficulty"; d["params"].add(1); send_json(d); add_pool_log("Sent subscribe, authorize, and suggested difficulty 1"); }
-void submit_share(uint64_t share_nonce, const uint8_t hash[32]) { DynamicJsonDocument d(512); last_share_request_id = request_id; d["id"] = request_id++; d["method"] = "mining.submit"; JsonArray p = d["params"].to<JsonArray>(); p.add(settings.pool_username); p.add(job_id); if (settings.pow_mode == POW_BITCOIN_STRATUM || (settings.pow_mode == POW_SIA && stratum_extranonce2.length())) { p.add(stratum_extranonce2); p.add(stratum_ntime); String nonce_hex = String(share_nonce, HEX); while (nonce_hex.length() < (settings.pow_mode == POW_SIA ? 16 : 8)) nonce_hex = "0" + nonce_hex; p.add(nonce_hex); } else { p.add(String(share_nonce)); p.add(hex_of(hash, 32)); } send_json(d); ++shares_submitted; add_pool_log(String("Submitted share for job ") + job_id + ", nonce " + String(share_nonce)); }
+void subscribe() { DynamicJsonDocument d(256); subscribe_request_id = request_id; d["id"] = request_id++; d["method"] = "mining.subscribe"; d["params"].add("retardminer/0.1"); send_json(d); d.clear(); authorize_request_id = request_id; d["id"] = request_id++; d["method"] = "mining.authorize"; JsonArray p = d["params"].to<JsonArray>(); p.add(settings.pool_username); p.add(settings.pool_password); send_json(d); add_pool_log("Sent subscribe and authorize"); }
+void submit_share(uint64_t share_nonce, const uint8_t hash[32]) { DynamicJsonDocument d(512); last_share_request_id = request_id; d["id"] = request_id++; d["method"] = "mining.submit"; JsonArray p = d["params"].to<JsonArray>(); p.add(settings.pool_username); p.add(job_id); if (settings.pow_mode == POW_PYBLOCK_BLAKE2B || (settings.pow_mode == POW_SIA && stratum_extranonce2.length())) { p.add(stratum_extranonce2); p.add(stratum_ntime); String nonce_hex = String(share_nonce, HEX); while (nonce_hex.length() < (settings.pow_mode == POW_SIA ? 16 : 8)) nonce_hex = "0" + nonce_hex; p.add(nonce_hex); } else { p.add(String(share_nonce)); p.add(hex_of(hash, 32)); } send_json(d); ++shares_submitted; add_pool_log(String("Submitted share for job ") + job_id + ", nonce " + String(share_nonce)); }
 bool set_job(const char *id, const char *header_hex, const char *target_hex) {
   size_t target_len = 0;
   last_template_error = "";
   if (!id || !header_hex || !target_hex) { last_template_error = "missing job id, header, or target"; Serial.println("ignored notify: missing job id, header, or target"); return false; }
   if (!decode_hex(header_hex, header, MAX_HEADER, header_len)) { last_template_error = "header is invalid hex or exceeds 256 bytes"; Serial.println("ignored notify: invalid or oversized header hex"); return false; }
-  if (header_len < 4) { last_template_error = "header is shorter than 4 bytes"; Serial.println("ignored notify: header is too short"); return false; }
+  if (header_len != 80) { last_template_error = "BLAKE2b-Sia requires an 80-byte header"; Serial.println("ignored notify: BLAKE2b-Sia mode requires an 80-byte Sia header"); return false; }
   if (!decode_hex(target_hex, target, sizeof(target), target_len) || target_len != sizeof(target)) { last_template_error = "target is not exactly 32 bytes of hex"; Serial.println("ignored notify: target must be exactly 32 bytes of hex"); return false; }
-  const bool knots_v2 = is_knots_blake2b_v2_header(header, header_len);
-  if (settings.pow_mode == POW_KNOTS_V2 && !knots_v2) { last_template_error = "Knots v2 requires a marked 164-byte header"; Serial.println("ignored notify: Knots v2 mode requires a marked 164-byte header"); return false; }
-  if (settings.pow_mode == POW_SIA && header_len != 80) { last_template_error = "BLAKE2b-Sia requires an 80-byte header"; Serial.println("ignored notify: BLAKE2b-Sia mode requires an 80-byte Sia header"); return false; }
-  if (settings.pow_mode == POW_PLAIN_BLAKE2B && ((header[3] & 0x80U) || header_len < settings.nonce_offset + settings.nonce_size)) { last_template_error = "plain mode requires an unmarked header fitting its nonce layout"; Serial.println("ignored notify: plain mode requires an unmarked header fitting its nonce layout"); return false; }
   job_id = id; nonce = esp_random(); ++templates_received; last_template_ms = millis();
   add_pool_log(String("Received template ") + job_id + " (" + String(header_len) + " byte header)");
   portENTER_CRITICAL(&mining_mux);
-  memcpy(worker_job.header, header, header_len); memcpy(worker_job.target, target, sizeof(target)); worker_job.header_len = header_len; worker_job.mode = settings.pow_mode;
-  worker_job.nonce_offset = settings.pow_mode == POW_KNOTS_V2 ? 76 : settings.pow_mode == POW_SIA ? 32 : settings.nonce_offset;
-  worker_job.nonce_size = settings.pow_mode == POW_KNOTS_V2 ? 4 : settings.pow_mode == POW_SIA ? 8 : settings.nonce_size; ++worker_job.generation;
+  memcpy(worker_job.header, header, header_len); memcpy(worker_job.target, target, sizeof(target)); worker_job.header_len = header_len; worker_job.mode = POW_SIA;
+  worker_job.nonce_offset = 32; worker_job.nonce_size = 8; ++worker_job.generation;
   portEXIT_CRITICAL(&mining_mux);
   return true;
-}
-bool set_stratum_job(JsonArray job) {
-  last_template_error = "";
-  if (job.size() < 9) { last_template_error = "standard Stratum notify has fewer than 9 fields"; return false; }
-  if (!stratum_extranonce1.length() || !stratum_extranonce2_size) { last_template_error = "pool did not provide extranonce data in subscribe reply"; return false; }
-  const char *id = job[0] | "", *prevhash = job[1] | "", *coinb1 = job[2] | "", *coinb2 = job[3] | "";
-  stratum_version = job[5] | ""; stratum_nbits = job[6] | ""; stratum_ntime = job[7] | "";
-  String nonce2; nonce2.reserve(stratum_extranonce2_size * 2); for (uint8_t i = 0; i < stratum_extranonce2_size; ++i) { const uint8_t value = uint8_t(esp_random() >> ((i & 3) * 8)); nonce2 += String(value < 16 ? "0" : "") + String(value, HEX); }
-  String coinbase_hex = String(coinb1) + stratum_extranonce1 + nonce2 + coinb2;
-  const size_t coinbase_size = coinbase_hex.length() / 2; uint8_t *coinbase = static_cast<uint8_t *>(malloc(coinbase_size)); size_t decoded = 0;
-  if (!id[0] || !coinbase || !decode_hex(coinbase_hex.c_str(), coinbase, coinbase_size, decoded) || decoded != coinbase_size) { last_template_error = "coinbase fields are invalid hex or allocation failed"; if (coinbase) free(coinbase); return false; }
-  uint8_t merkle[32]; sha256d(coinbase, coinbase_size, merkle); free(coinbase);
-  JsonArray branches = job[4].as<JsonArray>();
-  for (JsonVariant branch : branches) { uint8_t right[32], joined[64]; size_t n = 0; if (!decode_hex(branch.as<const char *>(), right, sizeof(right), n) || n != sizeof(right)) { last_template_error = "a merkle branch is not 32 bytes of hex"; return false; } memcpy(joined, merkle, 32); memcpy(joined + 32, right, 32); sha256d(joined, sizeof(joined), merkle); }
-  if (!decode_reversed_words(stratum_version.c_str(), header, 1) || !decode_reversed_words(prevhash, header + 4, 8) || !decode_reversed_words(stratum_ntime.c_str(), header + 68, 1) || !decode_reversed_words(stratum_nbits.c_str(), header + 72, 1)) { last_template_error = "version, previous hash, nTime, or nBits is invalid"; return false; }
-  for (size_t i = 0; i < 32; ++i) header[36 + i] = merkle[31 - i]; memset(header + 76, 0, 4); header_len = 80; job_id = id; stratum_extranonce2 = nonce2; nonce = esp_random(); ++templates_received; last_template_ms = millis(); set_stratum_target(pool_difficulty.toDouble());
-  portENTER_CRITICAL(&mining_mux); memcpy(worker_job.header, header, header_len); memcpy(worker_job.target, target, sizeof(target)); worker_job.header_len = header_len; worker_job.mode = POW_BITCOIN_STRATUM; worker_job.nonce_offset = 76; worker_job.nonce_size = 4; ++worker_job.generation; portEXIT_CRITICAL(&mining_mux);
-  add_pool_log(String("Received Bitcoin Stratum template ") + job_id + " (" + String(branches.size()) + " merkle branches)"); return true;
 }
 bool set_f2pool_sia_job(JsonArray job) {
   last_template_error = "";
@@ -453,7 +485,7 @@ void process_line(const String &line) {
   const char *method = d["method"] | ""; JsonVariant params = d["params"];
   pool_last_message = method;
   if (!d["error"].isNull()) { String detail; serializeJson(d["error"], detail); add_pool_log(String("ERROR: Pool message ") + (method[0] ? method : "without method") + ": " + detail); return; }
-  if (!strcmp(method, "mining.set_difficulty")) { pool_difficulty = String(params[0].as<double>(), 6); if (settings.pow_mode == POW_BITCOIN_STRATUM || settings.pow_mode == POW_SIA) { if (settings.pow_mode == POW_SIA) set_sia_stratum_target(pool_difficulty.toDouble()); else set_stratum_target(pool_difficulty.toDouble()); portENTER_CRITICAL(&mining_mux); memcpy(worker_job.target, target, sizeof(target)); portEXIT_CRITICAL(&mining_mux); } add_pool_log(String("Pool set difficulty to ") + pool_difficulty); return; }
+  if (!strcmp(method, "mining.set_difficulty")) { pool_difficulty = String(params[0].as<double>(), 6); if (settings.pow_mode == POW_SIA) set_sia_stratum_target(pool_difficulty.toDouble()); else set_pyblock_blake2b_target(pool_difficulty.toDouble()); portENTER_CRITICAL(&mining_mux); memcpy(worker_job.target, target, sizeof(target)); portEXIT_CRITICAL(&mining_mux); add_pool_log(String("Pool set difficulty to ") + pool_difficulty); return; }
   if (!strcmp(method, "mining.set_extranonce")) { stratum_extranonce1 = params[0] | ""; stratum_extranonce2_size = params[1] | 0; add_pool_log(String("Pool changed extranonce: ") + stratum_extranonce1); return; }
   if (!strcmp(method, "client.show_message")) { pool_server_message = params[0] | ""; add_pool_log(String("Pool says: ") + pool_server_message); return; }
   // Supported pool notification forms: {params:[jobId,headerHex,targetHex]}
@@ -463,30 +495,49 @@ void process_line(const String &line) {
     if (params.is<JsonArray>()) {
       JsonArray array = params.as<JsonArray>();
       if (array.size() >= 9) { stratum_version = array[5] | ""; stratum_nbits = array[6] | ""; stratum_ntime = array[7] | ""; }
-      ok = settings.pow_mode == POW_BITCOIN_STRATUM ? set_stratum_job(array) : settings.pow_mode == POW_SIA && array.size() >= 9 ? set_f2pool_sia_job(array) : set_job(array[0].as<const char *>(), array[1].as<const char *>(), array[2].as<const char *>());
+      ok = settings.pow_mode == POW_PYBLOCK_BLAKE2B ? set_pyblock_blake2b_job(array) : settings.pow_mode == POW_SIA && array.size() >= 9 ? set_f2pool_sia_job(array) : set_job(array[0].as<const char *>(), array[1].as<const char *>(), array[2].as<const char *>());
     } else {
       ok = set_job(params["id"].as<const char *>(), params["header"].as<const char *>(), params["target"].as<const char *>());
     }
-    if (!ok) { Serial.println("ignored notify: expected job id, header hex and 32-byte target hex"); add_pool_log(String("ERROR: Rejected invalid template notification: ") + (last_template_error.length() ? last_template_error : "Stratum fields are incomplete or malformed")); }
+    if (!ok) { Serial.print("ignored notify: "); Serial.println(last_template_error.length() ? last_template_error : "Stratum fields are incomplete or malformed"); add_pool_log(String("ERROR: Rejected invalid template notification: ") + (last_template_error.length() ? last_template_error : "Stratum fields are incomplete or malformed")); }
   } else if (method[0]) { String detail; serializeJson(params, detail); add_pool_log(String("Pool message ") + method + ": " + detail); }
   else add_pool_log(String("Pool message: ") + line);
 }
 void service_pool() {
-  if (!pool.connected()) { if (pool_was_connected) add_pool_log("Pool connection closed"); pool_was_connected = false; if (millis() - last_connect_attempt < 5000) return; last_connect_attempt = millis(); ++pool_connection_attempts; if (pool.connect(settings.pool_host.c_str(), settings.pool_port)) { pool_was_connected = true; pool_connected_since = millis(); ++pool_sessions; add_pool_log(String("Connected to ") + settings.pool_host + ":" + String(settings.pool_port)); subscribe(); } else add_pool_log(String("Connection attempt failed: ") + settings.pool_host + ":" + String(settings.pool_port)); return; }
-  while (pool.available()) { String line = pool.readStringUntil('\n'); if (line.length()) process_line(line); }
+  if (!pool.connected()) {
+    if (pool_was_connected) {
+      Serial.println("Pool connection closed"); add_pool_log("Pool connection closed");
+      // A session that never got a single reply looks like the pool (or something upstream) is
+      // rejecting/rate-limiting us - back off harder so we don't keep hammering it. Any real
+      // reply means the pool is talking to us, so a normal disconnect (e.g. idle timeout) just
+      // retries at the base interval.
+      if (!session_got_reply) { reconnect_backoff_ms = min(reconnect_backoff_ms * 2, RECONNECT_BACKOFF_MAX_MS); Serial.print("No reply this session; backing off to "); Serial.print(reconnect_backoff_ms / 1000); Serial.println("s"); }
+      else reconnect_backoff_ms = RECONNECT_BACKOFF_MIN_MS;
+    }
+    pool_was_connected = false;
+    if (millis() - last_connect_attempt < reconnect_backoff_ms) return;
+    last_connect_attempt = millis(); ++pool_connection_attempts; session_got_reply = false;
+    Serial.print("Connecting to "); Serial.print(settings.pool_host); Serial.print(":"); Serial.print(settings.pool_port);
+    Serial.print(" mode="); Serial.print(settings.pow_mode); Serial.print(" wifi="); Serial.println(WiFi.status() == WL_CONNECTED ? "up" : "down");
+    if (pool.connect(settings.pool_host.c_str(), settings.pool_port)) {
+      pool_was_connected = true; pool_connected_since = millis(); ++pool_sessions;
+      Serial.println("Connected"); add_pool_log(String("Connected to ") + settings.pool_host + ":" + String(settings.pool_port));
+      subscribe();
+    } else { Serial.println("Connection attempt failed"); add_pool_log(String("Connection attempt failed: ") + settings.pool_host + ":" + String(settings.pool_port)); }
+    return;
+  }
+  while (pool.available()) { String line = pool.readStringUntil('\n'); if (line.length()) { session_got_reply = true; process_line(line); } }
 }
 void mine_slice() {
   if (!header_len) return;
-  const bool knots_v2 = settings.pow_mode == POW_KNOTS_V2;
-  const bool sia = settings.pow_mode == POW_SIA;
-  const uint16_t nonce_offset = knots_v2 ? 76 : sia ? 32 : settings.nonce_offset;
-  const uint8_t nonce_size = knots_v2 || sia ? (knots_v2 ? 4 : 8) : settings.nonce_size;
+  const bool pyblock = settings.pow_mode == POW_PYBLOCK_BLAKE2B;
+  const uint16_t nonce_offset = 32;
+  const uint8_t nonce_size = pyblock ? 4 : 8;
   for (unsigned i = 0; i < 256; ++i) {
     uint64_t n = nonce++;
     for (unsigned b = 0; b < nonce_size; ++b) header[nonce_offset + b] = uint8_t(n >> (8 * b)); // Bitcoin-style little-endian nonce
     uint8_t hash[32];
-    if (knots_v2) knots_blake2b_v2_pow(header, header_len, hash);
-    else if (settings.pow_mode == POW_BITCOIN_STRATUM) sha256d(header, header_len, hash);
+    if (pyblock) pyblock_blake2b_pow(header, hash);
     else blake2b_256(header, header_len, hash);
     add_hashes(1);
     if (meets_target(hash)) submit_share(n, hash);
@@ -500,14 +551,14 @@ void miner_worker(void *) {
     if (worker_job.generation != generation) { local = worker_job; generation = worker_job.generation; worker_nonce = esp_random() ^ 0x80000000ULL; }
     portEXIT_CRITICAL(&mining_mux);
     if (!local.header_len) { vTaskDelay(1); continue; }
-    for (unsigned i = 0; i < 256; ++i) {
+    for (unsigned i = 0; i < 4096; ++i) {
       const uint64_t n = worker_nonce++;
       for (unsigned b = 0; b < local.nonce_size; ++b) local.header[local.nonce_offset + b] = uint8_t(n >> (8 * b));
       uint8_t hash[32];
-      if (local.mode == POW_KNOTS_V2) knots_blake2b_v2_pow(local.header, local.header_len, hash); else if (local.mode == POW_BITCOIN_STRATUM) sha256d(local.header, local.header_len, hash); else blake2b_256(local.header, local.header_len, hash);
+      if (local.mode == POW_PYBLOCK_BLAKE2B) pyblock_blake2b_pow(local.header, hash); else blake2b_256(local.header, local.header_len, hash);
       if (meets_target(hash, local.target) && found_shares) { FoundShare share{n, {}, generation}; memcpy(share.hash, hash, sizeof(hash)); xQueueSend(found_shares, &share, 0); }
     }
-    add_hashes(256);
+    add_hashes(4096);
     vTaskDelay(1); // Leave core 0 time for Wi-Fi and the web server transport.
   }
 }
@@ -523,6 +574,11 @@ void service_found_shares() {
 #ifndef UNIT_TEST
 void setup() {
   Serial.begin(115200); pinMode(STATUS_LED_PIN, OUTPUT); digitalWrite(STATUS_LED_PIN, LOW); delay(200); load_settings();
+  Serial.print("Loaded settings: device="); Serial.print(settings.device_name);
+  Serial.print(" host="); Serial.print(settings.pool_host); Serial.print(":"); Serial.print(settings.pool_port);
+  Serial.print(" user="); Serial.print(settings.pool_username);
+  Serial.print(" pow_mode="); Serial.print(settings.pow_mode);
+  Serial.print(" valid="); Serial.println(valid_settings(settings) ? "yes" : "no");
   found_shares = xQueueCreate(8, sizeof(FoundShare));
   xTaskCreatePinnedToCore(miner_worker, "miner-worker", 4096, nullptr, 1, nullptr, 0);
   pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
@@ -544,6 +600,13 @@ void loop() {
     current_hashrate = delta * 1000.0 / (now - last_report);
     last_report_hashes = total_hashes;
     last_report = now;
+    Serial.print("heartbeat: pool="); Serial.print(pool.connected() ? "up" : "down");
+    Serial.print(" header_len="); Serial.print(header_len);
+    Serial.print(" job="); Serial.print(job_id);
+    Serial.print(" rate="); Serial.print(current_hashrate);
+    Serial.print(" H/s submitted="); Serial.print(shares_submitted);
+    Serial.print(" accepted="); Serial.print(shares_accepted);
+    Serial.print(" rejected="); Serial.println(shares_rejected);
   }
 }
 #endif
