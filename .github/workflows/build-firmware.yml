@@ -33,15 +33,14 @@ jobs:
 
       - name: Package browser-flasher files
         run: |
-          PACKAGE_VERSION="${BUILD_VERSION#v}"
           python tools/package_firmware.py \
-            --version "$PACKAGE_VERSION" \
+            --version "$BUILD_VERSION" \
             --output dist
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: retardminer-firmware-${{ github.ref_name }}
+          name: retardminer-firmware-${{ env.BUILD_VERSION }}
           path: dist/
           if-no-files-found: error
           retention-days: 90
